@@ -20,11 +20,15 @@ KEEPALIVE_INTERVAL = 90
 WATCHDOG_TIMEOUT = 4.0
 
 
-def sleep_until_alarms():
-    """Deep sleep until the button is pressed or the keepalive timer fires. Does not return."""
-    time_alarm = alarm.time.TimeAlarm(monotonic_time=time.monotonic() + KEEPALIVE_INTERVAL)
+def sleep_until_alarms(keepalive=True):
+    """Deep sleep until the button is pressed or, with keepalive, the keepalive timer fires.
+    Without keepalive the power bank switches itself off after a while. Does not return."""
     pin_alarm = alarm.pin.PinAlarm(pin=board.EXTERNAL_BUTTON, value=False, edge=True, pull=True)
-    alarm.exit_and_deep_sleep_until_alarms(pin_alarm, time_alarm)
+    if keepalive:
+        time_alarm = alarm.time.TimeAlarm(monotonic_time=time.monotonic() + KEEPALIVE_INTERVAL)
+        alarm.exit_and_deep_sleep_until_alarms(pin_alarm, time_alarm)
+    else:
+        alarm.exit_and_deep_sleep_until_alarms(pin_alarm)
 
 
 def enable_watchdog():

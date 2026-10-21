@@ -23,6 +23,9 @@ import time
 NEOPIXEL_AMOUNT = 72
 BRIGHTNESS = 0.90
 IDLE_SLEEP_SEC = 45.0
+# Holding the button this long shuts the saber down without the keepalive, so the power
+# bank switches itself off and cuts all power. The power bank button starts it again.
+SHUTDOWN_HOLD_SEC = 10.0
 # Duration of the fade when changing color
 COLOR_FADE_SEC = 0.4
 # Rainbow blade scrolls from hilt to tip at this speed
@@ -109,8 +112,17 @@ FIRE_SPARK_PIXELS = 7
 # Heat 0-255 to color: never black (embers), up to a warm yellow. On average this draws
 # less current than the violet blade.
 FIRE_HEAT_COLORS = ((0.0, (60, 6, 0)), (0.35, (255, 40, 0)), (0.7, (255, 120, 5)), (1.0, (255, 170, 40)))
-# The fire blade as one plain color, without flames
+# The fire blade with effects off
 FIRE_STILL_COLOR = 0xFF5000
+# Settings gestures: hold the button with the blade pointing straight up or down and flip
+# the blade to point the other way. Up -> down toggles effects, down -> up toggles sound.
+# The accelerometer axis along the blade, and its sign when the tip points up
+# (measured on the saber: tip up reads y = -9.3 m/s^2):
+BLADE_AXIS = 1  # 0 = x, 1 = y, 2 = z
+BLADE_UP_DIRECTION = -1
+# Vertical = at least this much gravity along the blade, at most this much sideways (m/s^2)
+VERTICAL_MIN_ACCEL = 8.0
+VERTICAL_MAX_SIDEWAYS = 4.0
 # Without accelerometer, movement can't be detected. Sleep this long after the
 # last button press if the blade is on (IDLE_SLEEP_SEC is used when it's off).
 NO_ACCEL_ON_SLEEP_SEC = 600.0
@@ -120,7 +132,9 @@ WATCHDOG_FEED_INTERVAL = 0.5
 TASK_STALL_LIMIT = 2.5
 # microcontroller.nvm layout: the drive is read-only for CircuitPython (PC can write
 # code to it), so everything the saber must remember lives in nvm instead.
-NVM_COLOR = 0  # 1 byte: chosen color + 1
+NVM_COLOR = 0  # 1 byte: chosen color + 1, plus the bits below
+NVM_EFFECTS_OFF_BIT = 0x40
+NVM_SOUND_OFF_BIT = 0x20
 NVM_LOG_LENGTH = 1  # 2 bytes, little endian: bytes used by the error log
 NVM_LOG_START = 3  # error log text up to the end of nvm (~4 KB)
 # Longest single error entry kept (the traceback is cut after this)
@@ -196,6 +210,7 @@ class Lightsaber:
         self.switch = switch
         self.power = power
         self._sleep_until_alarms = sleep_until_alarms
+        sounds.muted = not blade.color_store.sound_on
         now = time.monotonic()
         # Updated by each polling task; feed_watchdog resets the board if one goes stale
         self.heartbeats = {"switch": now, "accel": now}
@@ -218,9 +233,9 @@ class Lightsaber:
         self.switch.set_state(False)
         print("Lightsaber OFF")
 
-    def deep_sleep(self):
+    def deep_sleep(self, keepalive=True):
         print("Going to sleep")
-        self.blade.save_color()
+        self.blade.save_color(sound_on=not self.sounds.muted)
         if self.is_on():
             # Retract like a normal turn off, and let the sound finish before sleep cuts it
             self.sounds.stop_hum()
@@ -229,7 +244,18 @@ class Lightsaber:
             self.sounds.wait_until_done(timeout=2.0)
         self.switch.turn_off_led()
         self.switch.release_pins()
-        self._sleep_until_alarms()
+        self._sleep_until_alarms(keepalive=keepalive)
+
+    def shutdown(self, color_before_press):
+        """Very long press: sleep without the keepalive. The power bank sees no load and
+        switches itself off within a couple of minutes, so the saber has no power at all
+        until the power bank button is pressed. Until then the saber button still wakes it.
+        Does not return."""
+        print("Shutting down without keepalive")
+        self.blade.chosen_color_index = color_before_press  # undo the long-press color change
+        self.switch.blink(times=3)
+        wdog.feed()  # the retract and its sound take a moment
+        self.deep_sleep(keepalive=False)
 
     def swing(self):
         print("swung")
@@ -259,6 +285,45 @@ class Lightsaber:
     def is_on(self):
         return self.switch.pressed()
 
+    def blade_direction(self):
+        """+1 or -1 when the blade points straight up or down (which is which depends on
+        how the board is mounted), 0 otherwise or without accelerometer."""
+        reading = self.accelerometer.last
+        if reading is None:
+            return 0
+        along = reading[BLADE_AXIS]
+        sideways = sum(v * v for i, v in enumerate(reading) if i != BLADE_AXIS)
+        if sideways > VERTICAL_MAX_SIDEWAYS ** 2:
+            return 0
+        if along >= VERTICAL_MIN_ACCEL:
+            return 1
+        if along <= -VERTICAL_MIN_ACCEL:
+            return -1
+        return 0
+
+    def toggle_effects(self):
+        self.last_activity = time.monotonic()
+        self.blade.toggle_effects()
+        print("Effects", "on" if self.blade.effects_on else "off")
+
+    def toggle_sound(self):
+        """All sounds off/on. One long dip of the blade confirms; turning sound back on
+        while lit also restarts the hum, so it is heard too."""
+        self.last_activity = time.monotonic()
+        sounds = self.sounds
+        sounds.muted = not sounds.muted
+        if sounds.muted:
+            sounds.stop_hum()
+            sounds.stop()
+            sounds.pause_output()  # amplifier sleeps without an I2S clock
+        else:
+            if self.power.on:
+                sounds.resume_output()
+            if self.is_on():
+                sounds.start_hum()
+        self.blade.confirm(dips=1, dip_sec=0.3)
+        print("Sound", "off" if sounds.muted else "on")
+
 
 class Accelerometer:
     def __init__(self):
@@ -272,6 +337,7 @@ class Accelerometer:
         self.consecutive_errors = 0
         self.device = None
         self._int1 = None
+        self.last = None  # latest (x, y, z), None until the first good reading
 
     @property
     def available(self):
@@ -294,6 +360,7 @@ class Accelerometer:
     def disable(self, error):
         log_error("Accelerometer stopped responding, running without it", error)
         self.device = None
+        self.last = None
         self._release_int1()
 
     def sample(self):
@@ -374,6 +441,15 @@ class Switch:
         self._stop_animation()
         self._set_led(0.0, 0.0, 0.0)
 
+    def blink(self, times):
+        """Flash the LED ring white, e.g. to confirm a shutdown."""
+        self._stop_animation()
+        for _ in range(times):
+            self._set_led(1.0, 1.0, 1.0)
+            time.sleep(0.1)
+            self._set_led(0.0, 0.0, 0.0)
+            time.sleep(0.1)
+
     def _start_animation(self, kind):
         self.animation = kind
         if not self.animation_task or self.animation_task.done():
@@ -432,7 +508,7 @@ class Switch:
 
 
 class ColorStore:
-    """Remembers the chosen color across sleeps and power-offs.
+    """Remembers the chosen color and the effects setting across sleeps and power-offs.
 
     Uses microcontroller.nvm (outside the filesystem, so an interrupted write
     can't corrupt code.py) and writes only when the value has changed.
@@ -444,11 +520,15 @@ class ColorStore:
         self.rainbow_index = rainbow_index
         self.nvm = _nvm()
         self.saved = None
+        self.effects_on = True  # set by load()
+        self.sound_on = True
 
     def load(self):
         index = self._read_nvm()
         if index is not None:
-            self.saved = index
+            self.saved = self.nvm[NVM_COLOR]
+            self.effects_on = not self.nvm[NVM_COLOR] & NVM_EFFECTS_OFF_BIT
+            self.sound_on = not self.nvm[NVM_COLOR] & NVM_SOUND_OFF_BIT
             return index
         # Older versions saved the color to a file; carry it over once
         index = self._read_file()
@@ -461,16 +541,22 @@ class ColorStore:
         print("No saved color, using default")
         return 0
 
-    def save(self, index):
-        if index == self.saved:
+    def save(self, index, effects_on=True, sound_on=True):
+        if self.nvm is None:
+            value = index
+        else:
+            # 0xFF (erased) and 0 mean "nothing saved"
+            value = ((index + 1) | (0 if effects_on else NVM_EFFECTS_OFF_BIT)
+                     | (0 if sound_on else NVM_SOUND_OFF_BIT))
+        if value == self.saved:
             return
         try:
             if self.nvm is not None:
-                self.nvm[NVM_COLOR] = index + 1  # 0xFF (erased) and 0 mean "nothing saved"
+                self.nvm[NVM_COLOR] = value
             else:
                 with open(self.LEGACY_FILE, "w") as f:
                     f.write(str(index))
-            self.saved = index
+            self.saved = value
         except Exception as e:
             print("Cannot save color:", e)
 
@@ -481,6 +567,9 @@ class ColorStore:
             value = self.nvm[NVM_COLOR]
         except Exception:
             return None
+        if value & 0x80:  # erased flash (0xFF) or garbage
+            return None
+        value &= ~(NVM_EFFECTS_OFF_BIT | NVM_SOUND_OFF_BIT)
         if 1 <= value <= self.color_count:
             return value - 1
         return None
@@ -539,10 +628,29 @@ class Blade:
         self._shown = [self.off] * self.neopixel_amount  # what the LEDs show right now
         self.color_store = ColorStore(self.color_count, self.rainbow_index)
         self.chosen_color_index = self.color_store.load()
+        self.effects_on = self.color_store.effects_on
         self.device = self._init_neopixels()
 
-    def save_color(self):
-        self.color_store.save(self.chosen_color_index)
+    def save_color(self, sound_on=None):
+        if sound_on is None:
+            sound_on = self.color_store.sound_on
+        self.color_store.save(self.chosen_color_index, self.effects_on, sound_on)
+
+    def confirm(self, dips, dip_sec):
+        """Dip the blade brightness to acknowledge a setting change."""
+        shown = self._shown
+        for _ in range(dips):
+            self._show(_scaled(shown, 0.25))
+            time.sleep(dip_sec)
+            self._show(shown)
+            time.sleep(0.08)
+
+    def toggle_effects(self):
+        """Effects (breathing, flowing bands, crackle, rainbow scroll) on/off. The blade dips
+        twice to confirm, then continues in the new mode."""
+        self.effects_on = not self.effects_on
+        self.confirm(dips=2, dip_sec=0.08)
+        self._crossfade()
 
     def set_next_color(self, change_immediately=False):
         self.chosen_color_index = (self.chosen_color_index + 1) % self.color_count
@@ -590,7 +698,7 @@ class Blade:
         """Extend the blade from hilt to tip behind a white-hot leading point. The red
         (unstable) blade stutters on the way out."""
         n = self.neopixel_amount
-        sputter = self.is_unstable()
+        sputter = self.effects_on and self.is_unstable()
         for i in range(n):
             out = frame[:i] + [_mix(frame[i], IGNITION_TIP_COLOR, 0.7)] + [self.off] * (n - i - 1)
             if i > 0:
@@ -616,7 +724,9 @@ class Blade:
         if now - self._last_frame_time < PULSE_FRAME_SEC:
             return
         self._last_frame_time = now
-        self._show(self._render(now))
+        frame = self._render(now)
+        if frame != self._shown:  # with effects off, nothing changes: skip the redraw
+            self._show(frame)
 
     def clash_flash(self):
         """Start the clash pulse; the animation frames draw it, so this doesn't block."""
@@ -630,9 +740,12 @@ class Blade:
     def _render(self, now):
         """The current color's animated frame at this moment, with every effect applied:
         crackle (red), fire, or breathing plus a flowing plasma (solid) or a scroll (rainbow),
-        then the swing glow and clash pulse."""
-        glowing = self.motion > SWING_GLOW_MIN_MOTION
-        if self.is_unstable():
+        then the swing glow and clash pulse. With effects off: the plain color
+        (rainbow standing still), and only the clash pulse."""
+        glowing = self.effects_on and self.motion > SWING_GLOW_MIN_MOTION
+        if not self.effects_on:
+            frame = self._frame(self.chosen_color_index)
+        elif self.is_unstable():
             frame = self._crackle(now)
         elif self.is_fire():
             frame = self._fire(now)
@@ -935,6 +1048,7 @@ class Sounds:
         self._hum_wave = None
         self._hum_on = False
         self.motion = 0.0  # swing intensity 0.0-1.0, set by Lightsaber.set_motion
+        self.muted = False  # set from the saved setting by Lightsaber
         self.mixer = self._make_mixer()
         self.hum_voice = self.mixer.voice[0]
         self.fx_voice = self.mixer.voice[1]
@@ -964,7 +1078,7 @@ class Sounds:
             bits_per_sample=bits, samples_signed=(bits == 16), buffer_size=2048)
 
     def play_sound_by_index(self, index, loop=False):
-        if not 0 <= index < len(self.files):
+        if self.muted or not 0 <= index < len(self.files):
             return
         try:
             self.stop()
@@ -975,7 +1089,7 @@ class Sounds:
             print("Cannot play sound:", e)
 
     def start_hum(self):
-        if self.HUM_INDEX >= len(self.files):
+        if self.muted or self.HUM_INDEX >= len(self.files):
             return
         try:
             if self._hum_wave is None:
@@ -1055,7 +1169,8 @@ class Power:
             return
         self.pin.value = True
         time.sleep(0.01)  # let the LEDs and amplifier power up
-        self.sounds.resume_output()
+        if not self.sounds.muted:
+            self.sounds.resume_output()
         self.on = True
 
     def off_if_idle(self):
@@ -1099,6 +1214,7 @@ async def poll_accelerometer(lightsaber):
         try:
             tapped, x, y, z = accel.sample()
             accel.consecutive_errors = 0
+            accel.last = (x, y, z)
         except (OSError, RuntimeError) as e:
             accel.consecutive_errors += 1
             if accel.consecutive_errors >= accel.max_consecutive_errors:
@@ -1109,7 +1225,8 @@ async def poll_accelerometer(lightsaber):
         xz_accel = x * x + z * z
         intensity = (xz_accel - MOTION_REST) / (accel.hit_threshold - MOTION_REST)
         lightsaber.set_motion(min(max(intensity, 0.0), 1.0))
-        if tapped:
+        if tapped and not lightsaber.switch.last_button_state:
+            # (ignored while the button is held: flipping the blade can register as a tap)
             print("tapped")
             lightsaber.change_color()
         elif lightsaber.is_on():
@@ -1141,14 +1258,18 @@ async def poll_accelerometer(lightsaber):
 async def poll_switch(lightsaber, turn_on_at_start=False):
     switch = lightsaber.switch
     long_press_handled = False
+    press_direction = 0  # blade direction when the press started (for the flip gesture)
+    color_at_press = lightsaber.blade.chosen_color_index
+    ignore_press = False
     if turn_on_at_start:
         lightsaber.turn_on()
     switch.device.update()
     if not switch.new_value():
         # Button is still held from the press that woke us up: ignore that press
         switch.last_button_state = True
-        switch.press_start_time = 0  # so releasing it doesn't count as a short press
+        switch.press_start_time = time.monotonic()
         long_press_handled = True
+        ignore_press = True
 
     while True:
         switch.device.update()
@@ -1164,11 +1285,30 @@ async def poll_switch(lightsaber, turn_on_at_start=False):
             # Button just pressed
             switch.press_start_time = time.monotonic()
             long_press_handled = False
+            ignore_press = False
+            color_at_press = lightsaber.blade.chosen_color_index
+            press_direction = lightsaber.blade_direction() if lightsaber.is_on() else 0
 
         elif current_button_state:
             # Button held
             press_duration = time.monotonic() - switch.press_start_time
-            if press_duration >= switch.long_press_threshold and not long_press_handled:
+            if ignore_press:
+                pass
+            elif press_duration >= SHUTDOWN_HOLD_SEC:
+                lightsaber.shutdown(color_at_press)
+            elif long_press_handled:
+                pass
+            elif press_direction:
+                # Pressed with the blade vertical: flipping it the other way while holding
+                # toggles effects (up -> down) or sound (down -> up). Without a flip this
+                # becomes a color change on release.
+                if lightsaber.blade_direction() == -press_direction:
+                    if press_direction == BLADE_UP_DIRECTION:
+                        lightsaber.toggle_effects()  # up -> down
+                    else:
+                        lightsaber.toggle_sound()  # down -> up
+                    long_press_handled = True
+            elif press_duration >= switch.long_press_threshold:
                 if lightsaber.is_on():
                     lightsaber.change_color()
                 else:
@@ -1178,11 +1318,15 @@ async def poll_switch(lightsaber, turn_on_at_start=False):
         elif not current_button_state and switch.last_button_state:
             # Button released
             press_duration = switch.get_press_duration()
-            if press_duration < switch.long_press_threshold:
+            if ignore_press:
+                pass
+            elif press_duration < switch.long_press_threshold:
                 if lightsaber.is_on():
                     lightsaber.turn_off()
                 else:
                     lightsaber.turn_on()
+            elif not long_press_handled and lightsaber.is_on():
+                lightsaber.change_color()  # vertical long press without a flip
 
         switch.last_button_state = current_button_state
 
