@@ -10,6 +10,7 @@ import audiomixer
 import asyncio
 import board
 from digitalio import DigitalInOut, Direction, Pull
+import math
 import microcontroller
 from microcontroller import watchdog as wdog
 import neopixel
@@ -22,13 +23,13 @@ import time
 NEOPIXEL_AMOUNT = 72
 BRIGHTNESS = 0.90
 IDLE_SLEEP_SEC = 45.0
-# Duration of a color fade to or from rainbow
-PER_PIXEL_FADE_SEC = 0.4
+# Duration of the fade when changing color
+COLOR_FADE_SEC = 0.4
 # Rainbow blade scrolls from hilt to tip at this speed
 RAINBOW_SCROLL_PIXELS_PER_SEC = 12.0
 # Positions computed between two pixels, so the scroll moves smoothly instead of in pixel jumps
 RAINBOW_SUBSTEPS = 8
-# How often the lit blade is redrawn (rainbow scroll) and the hum volume updated
+# How often the lit blade is redrawn (rainbow scroll, shimmer) and the hum volume updated
 BLADE_FRAME_SEC = 0.02
 # After a swing or hit sound, wait this long before another swing sound can start
 MOTION_SOUND_COOLDOWN_SEC = 0.3
@@ -40,6 +41,76 @@ HUM_MOTION_BOOST = 0.35
 HUM_DUCKED_FACTOR = 0.4
 # xz acceleration (m/s^2 squared) counted as "not moving" for the motion hum; gravity alone is ~96
 MOTION_REST = 100.0
+# Color options: the palette colors, then rainbow, then fire
+RAINBOW_INDEX = 6
+FIRE_INDEX = 7
+# Clash: a bright pulse runs from hilt to tip and fades out. Only a few LEDs are bright at
+# a time, so it stays within what the power bank can supply (two strips of 72 LEDs).
+CLASH_PULSE_COLOR = 0xC8C8C8
+CLASH_PULSE_SEC = 0.3
+CLASH_PULSE_WIDTH = 12
+# Fast swings blend the blade towards a dim white, by up to this fraction at full speed
+SWING_GLOW_MAX = 0.25
+SWING_GLOW_COLOR = 0xA0A0A0
+SWING_GLOW_MIN_MOTION = 0.03
+# Glow steps for solid colors, where the glow is built into cached shade tables
+SWING_GLOW_STEPS = 16
+# Ignition: a white-hot point leads the blade out. Retraction: the edge glows like an ember.
+IGNITION_TIP_COLOR = 0xFFFFFF
+RETRACT_EMBER_COLOR = 0xFF6020
+# Red (unstable) ignition stutters: chance per step that the lit part flickers dim
+IGNITION_SPUTTER_CHANCE = 0.12
+# Color change: the new color runs up the blade from the hilt, with a soft edge this long
+WIPE_SOFT_PIXELS = 8
+# "Breathing" of the lit blade: dims by up to this fraction of the light and back,
+# about once per period. The blade is redrawn this often.
+PULSE_DEPTH = 0.4
+PULSE_PERIOD_SEC = 2.0
+PULSE_FRAME_SEC = 0.02
+# Each breath is randomly up to this fraction longer/shorter and deeper/shallower,
+# so it never feels like a metronome
+PULSE_VARIATION = 0.15
+# Share of each breath spent dimming; brightening back is quicker, like breathing in
+PULSE_DIM_SHARE = 0.6
+# Eyes see brightness roughly as (light output) ** (1 / 2.2). The breath is shaped on
+# that "seen" scale, so it doesn't seem to linger near full brightness.
+PERCEIVED_GAMMA = 2.2
+# Plasma: faint bands of light flowing from hilt to tip on solid colors (not rainbow, crackle
+# or fire). Two waves of different length and speed, so the flow never repeats exactly.
+# Each is up to this fraction dimmer, this long, and moves this fast:
+RIPPLE_DEPTH = 0.12
+RIPPLE_WAVELENGTH_PIXELS = 24
+RIPPLE_SPEED_PIXELS_PER_SEC = 18.0
+RIPPLE2_DEPTH = 0.08
+RIPPLE2_WAVELENGTH_PIXELS = 15
+RIPPLE2_SPEED_PIXELS_PER_SEC = 11.0
+# Ripple positions computed between pixels, for smooth movement
+RIPPLE_SUBSTEPS = 4
+# Brightness steps in the precomputed shade table of the current color
+SHADE_LEVELS = 64
+# Unstable "Kylo Ren" crackle, used instead of the pulse for this color (red)
+UNSTABLE_COLOR_INDEX = 0
+UNSTABLE_FRAME_SEC = 0.03
+# The whole blade crackles: each frame this many random pixels get a new shade of red
+UNSTABLE_PIXELS_PER_FRAME = 20
+# Shades picked from with equal chance: mostly full red, sometimes dimmer, rarely dark
+UNSTABLE_SHADES = (
+    (0xFF0000,) * 6 + (0xD00000,) * 3 + (0xA00000,) * 3
+    + (0x700000,) * 2 + (0x400000, 0x180000)
+)
+# Brightness drops by up to this fraction, rarely by much (mostly bright, occasional deep dips)
+UNSTABLE_FLICKER_DEPTH = 0.4
+# Fire blade ("Fire2012"): flames rise from the hilt. Lower cooling = taller flames,
+# higher sparking = livelier. Sparks start in the first FIRE_SPARK_PIXELS.
+FIRE_FRAME_SEC = 0.03
+FIRE_COOLING = 45
+FIRE_SPARKING = 120
+FIRE_SPARK_PIXELS = 7
+# Heat 0-255 to color: never black (embers), up to a warm yellow. On average this draws
+# less current than the violet blade.
+FIRE_HEAT_COLORS = ((0.0, (60, 6, 0)), (0.35, (255, 40, 0)), (0.7, (255, 120, 5)), (1.0, (255, 170, 40)))
+# The fire blade as one plain color, without flames
+FIRE_STILL_COLOR = 0xFF5000
 # Without accelerometer, movement can't be detected. Sleep this long after the
 # last button press if the blade is on (IDLE_SLEEP_SEC is used when it's off).
 NO_ACCEL_ON_SLEEP_SEC = 600.0
@@ -167,6 +238,7 @@ class Lightsaber:
     def hit(self):
         print("hit")
         self.sounds.play_sound_by_index(random.randint(3, 10))
+        self.blade.clash_flash()
 
     def set_motion(self, intensity):
         """Swing intensity 0.0-1.0 from the accelerometer; drives the hum volume."""
@@ -259,7 +331,7 @@ class Switch:
         self.press_start_time = 0
         self.long_press_threshold = 0.25
         self.animation_task = None
-        self.rainbow_enabled = False
+        self.animation = None  # "rainbow", "fire" or None
         self.current_index = 0
         self.palette = [
             fancy.CRGB(255, 0, 0),
@@ -282,32 +354,45 @@ class Switch:
         self.led_g.deinit()
         self.led_b.deinit()
 
+    @property
+    def rainbow_enabled(self):
+        return self.animation == "rainbow"
+
     def update_led_color(self, index):
-        """Show the blade color on the switch LED. Index past the palette = rainbow."""
-        if index >= len(self.palette):
-            self.rainbow_enabled = True
-            if not self.animation_task or self.animation_task.done():
-                self.animation_task = asyncio.create_task(self._animate_rainbow())
+        """Show the blade color on the switch LED: cycling colors for rainbow, a flicker for fire."""
+        if index == FIRE_INDEX:
+            self._start_animation("fire")
+        elif index >= len(self.palette):
+            self._start_animation("rainbow")
         else:
-            self._stop_rainbow()
+            self._stop_animation()
             prev_color = self.palette[self.current_index]
             self.current_index = index
             self._fade_colors(prev_color, self.palette[index])
 
     def turn_off_led(self):
-        self._stop_rainbow()
+        self._stop_animation()
         self._set_led(0.0, 0.0, 0.0)
 
-    async def _animate_rainbow(self):
-        step = 0.0
-        while self.rainbow_enabled:
-            color = fancy.palette_lookup(self.palette, step)
-            self._set_led(color.red, color.green, color.blue)
-            step = (step + 0.01) % 1.0
-            await asyncio.sleep(0.09)
+    def _start_animation(self, kind):
+        self.animation = kind
+        if not self.animation_task or self.animation_task.done():
+            self.animation_task = asyncio.create_task(self._animate())
 
-    def _stop_rainbow(self):
-        self.rainbow_enabled = False
+    async def _animate(self):
+        step = 0.0
+        while self.animation:
+            if self.animation == "fire":
+                self._set_led(0.7 + 0.3 * random.random(), 0.1 + 0.3 * random.random(), 0.0)
+                await asyncio.sleep(0.06)
+            else:
+                color = fancy.palette_lookup(self.palette, step)
+                self._set_led(color.red, color.green, color.blue)
+                step = (step + 0.01) % 1.0
+                await asyncio.sleep(0.09)
+
+    def _stop_animation(self):
+        self.animation = None
         if self.animation_task and not self.animation_task.done():
             self.animation_task.cancel()
 
@@ -354,8 +439,9 @@ class ColorStore:
     """
     LEGACY_FILE = "/state"
 
-    def __init__(self, color_count):
+    def __init__(self, color_count, rainbow_index):
         self.color_count = color_count
+        self.rainbow_index = rainbow_index
         self.nvm = _nvm()
         self.saved = None
 
@@ -406,7 +492,7 @@ class ColorStore:
         except Exception:
             return None
         if value == -1:  # old versions used -1 for rainbow
-            value = self.color_count - 1
+            value = self.rainbow_index
         if 0 <= value < self.color_count:
             return value
         return None
@@ -425,13 +511,33 @@ class Blade:
             fancy.CRGB(0, 0, 255),    # blue
             fancy.CRGB(128, 0, 255),  # violet
         ]
-        # Color options are the palette colors followed by rainbow
-        self.rainbow_index = len(self.palette)
-        self.color_count = len(self.palette) + 1
+        # Color options are the palette colors followed by rainbow and fire
+        self.rainbow_index = RAINBOW_INDEX
+        self.fire_index = FIRE_INDEX
+        self.color_count = FIRE_INDEX + 1
         self._rainbow_phases = None  # built on first use
         self._rainbow_pos = 0.0  # scroll position in substeps
         self._last_animation = 0.0
-        self.color_store = ColorStore(self.color_count)
+        self._last_frame_time = 0.0
+        self._new_breath(0.0)
+        self._ripple_pos = 0.0  # in substeps
+        self._last_ripple = 0.0
+        self._ripple_table = None  # built on first use
+        self._ripple_table2 = None
+        self._ripple_pos2 = 0.0
+        self._heat = [0] * self.neopixel_amount  # fire blade
+        self._last_fire = 0.0
+        self._fire_colors = None  # heat 0-255 -> color, built on first use
+        self._clash_start = None
+        self.motion = 0.0  # swing intensity 0.0-1.0 (for the swing glow)
+        self._shades_color = None
+        self._shades = None  # the current color at SHADE_LEVELS + 1 brightness steps
+        self._shade_cache = {}  # glow step -> shade table, for the current color
+        self._crackle_frame = None  # current per-pixel shades of the unstable blade
+        self._crackle_dim = 0.0
+        self._last_crackle = 0.0
+        self._shown = [self.off] * self.neopixel_amount  # what the LEDs show right now
+        self.color_store = ColorStore(self.color_count, self.rainbow_index)
         self.chosen_color_index = self.color_store.load()
         self.device = self._init_neopixels()
 
@@ -439,46 +545,313 @@ class Blade:
         self.color_store.save(self.chosen_color_index)
 
     def set_next_color(self, change_immediately=False):
-        previous = self._frame(self.chosen_color_index)
         self.chosen_color_index = (self.chosen_color_index + 1) % self.color_count
+        if self.is_fire():
+            self._warm_fire()
         if change_immediately:
-            self._fade(previous, self._frame(self.chosen_color_index))
+            self._wipe()
 
-    def set_unstable(self):
-        pass
-
-    def set_on(self):
-        frame = self._frame(self.chosen_color_index)
-        for i in range(self.neopixel_amount):
-            self._show_step(i, frame[i])
-
-    def set_off(self):
-        for i in range(self.neopixel_amount - 1, -1, -1):
-            self._show_step(i, self.off)
-
-    def _init_neopixels(self):
-        pixels = neopixel.NeoPixel(board.EXTERNAL_NEOPIXELS, self.neopixel_amount, auto_write=False)
-        pixels.brightness = self.brightness
-        return pixels
+    def is_unstable(self):
+        return self.chosen_color_index == UNSTABLE_COLOR_INDEX
 
     def is_rainbow(self):
         return self.chosen_color_index == self.rainbow_index
 
-    def animate_rainbow(self):
-        """Scroll the rainbow one frame forward. Only call while the rainbow blade is lit."""
+    def is_fire(self):
+        return self.chosen_color_index == self.fire_index
+
+    def set_on(self):
         now = time.monotonic()
+        self._crackle_frame = None
+        self._clash_start = None
+        if self.is_fire():
+            self._warm_fire()
+        self._new_breath(now)  # the first breath starts at full brightness
+        self._ignite(self._render(now))
+        # Continue the animation from exactly this frame
+        now = time.monotonic()
+        self._new_breath(now)
+        self._last_ripple = self._last_animation = now
+
+    def set_off(self):
+        """Retract from tip to hilt; the receding edge glows like an ember."""
+        n = self.neopixel_amount
+        shown = list(self._shown)
+        for i in range(n - 1, -1, -1):
+            shown[i] = _mix(shown[i], RETRACT_EMBER_COLOR, 0.6)
+            if i + 1 < n:
+                shown[i + 1] = self.off
+            self.device[:] = shown
+            self.device.show()
+            time.sleep(0.004)
+        self._show([self.off] * n)
+
+    def _ignite(self, frame):
+        """Extend the blade from hilt to tip behind a white-hot leading point. The red
+        (unstable) blade stutters on the way out."""
+        n = self.neopixel_amount
+        sputter = self.is_unstable()
+        for i in range(n):
+            out = frame[:i] + [_mix(frame[i], IGNITION_TIP_COLOR, 0.7)] + [self.off] * (n - i - 1)
+            if i > 0:
+                out[i - 1] = _mix(frame[i - 1], IGNITION_TIP_COLOR, 0.3)
+            if sputter and random.random() < IGNITION_SPUTTER_CHANCE:
+                out = _scaled(out, 0.3)
+            self.device[:] = out
+            self.device.show()
+            time.sleep(0.004)
+        self._show(frame)
+
+    def _init_neopixels(self):
+        pixels = neopixel.NeoPixel(board.EXTERNAL_NEOPIXELS, self.neopixel_amount, auto_write=False)
+        # Fixed: all effects are drawn into the pixel values, so frames can be blended exactly
+        pixels.brightness = self.brightness
+        return pixels
+
+    def animate(self, motion=0.0):
+        """Draw the next animation frame. Only call while the blade is lit.
+        motion: swing intensity 0.0-1.0, for the swing glow."""
+        self.motion = motion
+        now = time.monotonic()
+        if now - self._last_frame_time < PULSE_FRAME_SEC:
+            return
+        self._last_frame_time = now
+        self._show(self._render(now))
+
+    def clash_flash(self):
+        """Start the clash pulse; the animation frames draw it, so this doesn't block."""
+        self._clash_start = time.monotonic()
+
+    def _show(self, frame):
+        self.device[:] = frame
+        self.device.show()
+        self._shown = frame
+
+    def _render(self, now):
+        """The current color's animated frame at this moment, with every effect applied:
+        crackle (red), fire, or breathing plus a flowing plasma (solid) or a scroll (rainbow),
+        then the swing glow and clash pulse."""
+        glowing = self.motion > SWING_GLOW_MIN_MOTION
+        if self.is_unstable():
+            frame = self._crackle(now)
+        elif self.is_fire():
+            frame = self._fire(now)
+        else:
+            light = self._breath(now)
+            if self.is_rainbow():
+                self._advance_rainbow(now)
+                frame = _scaled(self._rainbow_frame(), light)
+            else:
+                # Solid colors: the swing glow is built into the shade table, which is much
+                # cheaper than blending every pixel on every frame
+                glow_step = round(self.motion * SWING_GLOW_STEPS) if glowing else 0
+                glowing = False
+                shades = self._shade_table(glow_step)
+                k = light * SHADE_LEVELS
+                wave1, wave2 = self._ripple(now)
+                frame = [shades[int(k * a * b)] for a, b in zip(wave1, wave2)]
+        if glowing:
+            frame = _blend_all(frame, SWING_GLOW_COLOR, SWING_GLOW_MAX * self.motion)
+        if self._clash_start is not None:
+            self._clash_pulse(frame, now)
+        return frame
+
+    def _clash_pulse(self, frame, now):
+        """A bright band running from hilt to tip, fading as it goes."""
+        t = now - self._clash_start
+        if t >= CLASH_PULSE_SEC:
+            self._clash_start = None
+            return
+        n = self.neopixel_amount
+        half = CLASH_PULSE_WIDTH / 2
+        center = t / CLASH_PULSE_SEC * (n + CLASH_PULSE_WIDTH) - half
+        fade = 1 - t / CLASH_PULSE_SEC
+        for i in range(max(0, int(center - half)), min(n, int(center + half) + 1)):
+            weight = fade * (1 - abs(center - i) / half)
+            if weight > 0:
+                frame[i] = _mix(frame[i], CLASH_PULSE_COLOR, weight)
+
+    def _wipe(self):
+        """Color change: the new color's live animation runs up the blade from the hilt
+        over what was shown, with a soft edge."""
+        n = self.neopixel_amount
+        old = self._shown
+        start = time.monotonic()
+        while True:
+            now = time.monotonic()
+            t = (now - start) / COLOR_FADE_SEC
+            new = self._render(now)
+            if t >= 1:
+                break
+            front = t * (n + WIPE_SOFT_PIXELS)
+            out = []
+            for i in range(n):
+                w = (front - i) / WIPE_SOFT_PIXELS
+                if w >= 1:
+                    out.append(new[i])
+                elif w <= 0:
+                    out.append(old[i])
+                else:
+                    out.append(_mix(old[i], new[i], w))
+            self._show(out)
+        self._show(new)
+        self._last_frame_time = now
+
+    def _crossfade(self):
+        """Blend from what is shown now into the new color's live animation, which keeps
+        moving during the fade, so neither end of the fade jumps."""
+        old = [((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF) for c in self._shown]
+        start = time.monotonic()
+        while True:
+            now = time.monotonic()
+            k = int((now - start) / COLOR_FADE_SEC * 256)
+            new = self._render(now)
+            if k >= 256:
+                break
+            self._show([
+                ((r + ((((c >> 16) & 0xFF) - r) * k >> 8)) << 16)
+                | ((g + ((((c >> 8) & 0xFF) - g) * k >> 8)) << 8)
+                | (b + (((c & 0xFF) - b) * k >> 8))
+                for (r, g, b), c in zip(old, new)
+            ])
+        self._show(new)
+        self._last_frame_time = now
+
+    def _new_breath(self, start):
+        """Pick the length and depth of the next breath, with a little randomness."""
+        v = PULSE_VARIATION
+        self._breath_start = start
+        self._breath_period = PULSE_PERIOD_SEC * (1 + v * (2 * random.random() - 1))
+        depth = min(0.9, PULSE_DEPTH * (1 + v * (2 * random.random() - 1)))
+        self._breath_min_seen = (1 - depth) ** (1 / PERCEIVED_GAMMA)
+
+    def _breath(self, now):
+        """Light output factor (1.0 = full) of the breathing at this moment."""
+        u = (now - self._breath_start) / self._breath_period
+        if u >= 1:
+            # Next breath. After a long pause (blocking animation), start it fresh now.
+            self._new_breath(now if u >= 2 else self._breath_start + self._breath_period)
+            u = (now - self._breath_start) / self._breath_period
+        if u < PULSE_DIM_SHARE:
+            x = u / PULSE_DIM_SHARE  # dimming
+        else:
+            x = 1 - (u - PULSE_DIM_SHARE) / (1 - PULSE_DIM_SHARE)  # brightening back
+        # Half steady, half sine: soft turns at the top and bottom that never stop
+        eased = 0.5 * x + 0.25 * (1 - math.cos(math.pi * x))
+        seen = 1 - (1 - self._breath_min_seen) * eased
+        return seen ** PERCEIVED_GAMMA
+
+    def _ripple(self, now):
+        """The two plasma waves flowing from hilt to tip, as per-pixel factors (1.0 = no
+        dimming); the frame is their product."""
+        n = self.neopixel_amount
+        steps = RIPPLE_SUBSTEPS
+        len1 = RIPPLE_WAVELENGTH_PIXELS * steps
+        len2 = RIPPLE2_WAVELENGTH_PIXELS * steps
+        if self._ripple_table is None:
+            self._ripple_table = _wave_table(len1, RIPPLE_DEPTH, n * steps)
+            self._ripple_table2 = _wave_table(len2, RIPPLE2_DEPTH, n * steps)
+        dt = min(now - self._last_ripple, 0.05)
+        self._last_ripple = now
+        self._ripple_pos = (self._ripple_pos + dt * RIPPLE_SPEED_PIXELS_PER_SEC * steps) % len1
+        self._ripple_pos2 = (self._ripple_pos2 + dt * RIPPLE2_SPEED_PIXELS_PER_SEC * steps) % len2
+        # Negative offsets move the bands towards the tip (higher pixel numbers)
+        o1 = (-int(self._ripple_pos)) % len1
+        o2 = (-int(self._ripple_pos2)) % len2
+        return (self._ripple_table[o1:o1 + n * steps:steps],
+                self._ripple_table2[o2:o2 + n * steps:steps])
+
+    def _shade_table(self, glow_step=0):
+        """The current solid color at SHADE_LEVELS + 1 brightness steps, blended towards
+        white for the swing glow. Built once per color and glow step, then cached."""
+        color = self.palette[self.chosen_color_index].pack()
+        if color != self._shades_color:
+            self._shade_cache = {}
+            self._shades_color = color
+        shades = self._shade_cache.get(glow_step)
+        if shades is None:
+            r, g, b = (color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF
+            shades = [
+                (r * j // SHADE_LEVELS) << 16 | (g * j // SHADE_LEVELS) << 8 | (b * j // SHADE_LEVELS)
+                for j in range(SHADE_LEVELS + 1)
+            ]
+            if glow_step:
+                amount = SWING_GLOW_MAX * glow_step / SWING_GLOW_STEPS
+                shades = _blend_all(shades, SWING_GLOW_COLOR, amount)
+            self._shade_cache[glow_step] = shades
+        self._shades = shades
+        return shades
+
+    def _advance_rainbow(self, now):
+        """Move the rainbow scroll position."""
         # Cap the step so the rainbow doesn't jump after a blocking animation or a pause
         dt = min(now - self._last_animation, 0.05)
         self._last_animation = now
-        old = int(self._rainbow_pos)
         total = self.neopixel_amount * RAINBOW_SUBSTEPS
         self._rainbow_pos = (self._rainbow_pos + dt * RAINBOW_SCROLL_PIXELS_PER_SEC * RAINBOW_SUBSTEPS) % total
-        if int(self._rainbow_pos) != old:
-            self.device[:] = self._rainbow_frame()
-            self.device.show()
+
+    def _crackle(self, now):
+        """The unstable blade: random pixels all along the blade change shade, plus an
+        uneven flicker of the whole blade. Changes every UNSTABLE_FRAME_SEC."""
+        frame = self._crackle_frame
+        if frame is None:
+            frame = self._crackle_frame = self._frame(self.chosen_color_index)
+        if now - self._last_crackle >= UNSTABLE_FRAME_SEC:
+            self._last_crackle = now
+            n = self.neopixel_amount
+            shades = UNSTABLE_SHADES
+            for _ in range(UNSTABLE_PIXELS_PER_FRAME):
+                frame[random.randrange(n)] = shades[random.randrange(len(shades))]
+            # random() cubed: mostly near full brightness, now and then a deep dip
+            self._crackle_dim = UNSTABLE_FLICKER_DEPTH * random.random() ** 3
+        return _scaled(frame, 1 - self._crackle_dim)
+
+    def _fire(self, now):
+        """The fire blade: flames rising from the hilt (the classic "Fire2012" effect)."""
+        if now - self._last_fire >= FIRE_FRAME_SEC:
+            self._last_fire = now
+            self._fire_step()
+        colors = self._fire_palette()
+        return [colors[h] for h in self._heat]
+
+    def _warm_fire(self):
+        """Start with flames already burning instead of a dark blade."""
+        self._heat = [0] * self.neopixel_amount
+        for _ in range(60):
+            self._fire_step()
+
+    def _fire_step(self):
+        n = self.neopixel_amount
+        heat = self._heat
+        cooling = FIRE_COOLING * 10 // n + 2
+        for i in range(n):
+            h = heat[i] - random.randrange(cooling)
+            heat[i] = h if h > 0 else 0
+        for k in range(n - 1, 1, -1):  # heat drifts up towards the tip
+            heat[k] = (heat[k - 1] + 2 * heat[k - 2]) // 3
+        if random.random() < FIRE_SPARKING / 255:
+            y = random.randrange(FIRE_SPARK_PIXELS)
+            heat[y] = min(255, heat[y] + random.randrange(160, 256))
+
+    def _fire_palette(self):
+        if self._fire_colors is None:
+            colors = []
+            stops = FIRE_HEAT_COLORS
+            for h in range(256):
+                t = h / 255
+                for (t0, c0), (t1, c1) in zip(stops, stops[1:]):
+                    if t <= t1:
+                        f = (t - t0) / (t1 - t0)
+                        r, g, b = (int(a + (z - a) * f) for a, z in zip(c0, c1))
+                        colors.append((r << 16) | (g << 8) | b)
+                        break
+            self._fire_colors = colors
+        return self._fire_colors
 
     def _frame(self, index):
-        """Packed color of every pixel for the given color option."""
+        """Packed color of every pixel for the given color option, without animation."""
+        if index == self.fire_index:
+            return [FIRE_STILL_COLOR] * self.neopixel_amount
         if index == self.rainbow_index:
             return self._rainbow_frame()
         return [self.palette[index].pack()] * self.neopixel_amount
@@ -507,40 +880,34 @@ class Blade:
             row = [_mix(base[i], base[(i + 1) % n], t) for i in range(n)]
             self._rainbow_phases.append(row + row)
 
-    def _fade(self, old, new):
-        uniform = old.count(old[0]) == len(old) and new.count(new[0]) == len(new)
-        if not uniform:
-            self._fade_per_pixel(old, new)
-            return
-        steps = 100
-        for step in range(1, steps + 1):
-            self.device.fill(_mix(old[0], new[0], step / steps))
-            self.device.show()
 
-    def _fade_per_pixel(self, old, new):
-        """Fade to/from rainbow. Time-based so it lasts PER_PIXEL_FADE_SEC however
-        slow each frame is to compute; integer math and a single slice write keep frames cheap."""
-        channels = []
-        for a, b in zip(old, new):
-            r, g, bl = (a >> 16) & 0xFF, (a >> 8) & 0xFF, a & 0xFF
-            channels.append((r, g, bl, ((b >> 16) & 0xFF) - r, ((b >> 8) & 0xFF) - g, (b & 0xFF) - bl))
-        start = time.monotonic()
-        while True:
-            k = int((time.monotonic() - start) / PER_PIXEL_FADE_SEC * 256)
-            if k >= 256:
-                break
-            self.device[:] = [
-                ((r + (dr * k >> 8)) << 16) | ((g + (dg * k >> 8)) << 8) | (bl + (db * k >> 8))
-                for r, g, bl, dr, dg, db in channels
-            ]
-            self.device.show()
-        self.device[:] = new
-        self.device.show()
+def _wave_table(length, depth, extra):
+    """One sine wave of brightness factors, repeated so every offset is one strided slice."""
+    wave = [1 - depth * (0.5 + 0.5 * math.sin(2 * math.pi * k / length)) for k in range(length)]
+    return [wave[k % length] for k in range(length + extra)]
 
-    def _show_step(self, i, color):
-        self.device[i] = color
-        self.device.show()
-        time.sleep(0.004)
+
+def _blend_all(frame, color, amount):
+    """Every pixel blended towards color by amount (0.0-1.0), integer math."""
+    a = int(amount * 256)
+    cr, cg, cb = (color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF
+    out = []
+    for c in frame:
+        r, g, b = (c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF
+        out.append(((r + ((cr - r) * a >> 8)) << 16) | ((g + ((cg - g) * a >> 8)) << 8)
+                   | (b + ((cb - b) * a >> 8)))
+    return out
+
+
+def _scaled(frame, light):
+    """frame with every pixel dimmed to light (0.0-1.0), integer math."""
+    k = int(light * 256)
+    if k >= 256:
+        return list(frame)
+    return [
+        ((((c >> 16) & 0xFF) * k >> 8) << 16) | ((((c >> 8) & 0xFF) * k >> 8) << 8) | ((c & 0xFF) * k >> 8)
+        for c in frame
+    ]
 
 
 def _mix(a, b, t):
@@ -825,8 +1192,7 @@ async def animate_blade(lightsaber):
     while True:
         await asyncio.sleep(BLADE_FRAME_SEC)
         if lightsaber.is_on():
-            if blade.is_rainbow():
-                blade.animate_rainbow()
+            blade.animate(motion=lightsaber.sounds.motion)
             lightsaber.sounds.update_hum()
         else:
             # Blade off: power down LEDs and amplifier once the last sound has finished
