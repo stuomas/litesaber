@@ -15,8 +15,11 @@ import time
 from watchdog import WatchDogMode
 
 # Anker PowerCore 5000 turns off after ~2 minutes if power consumption is under
-# some limit. To prevent that, wake up periodically from deep sleep and flash a pixel.
+# some limit. To prevent that, wake up periodically from deep sleep and draw some current:
+# the LED strips are powered for KEEPALIVE_LOAD_SEC (two strips of 72 LEDs draw ~100 mA
+# even when dark) and one pixel flashes. A 50 ms flash alone was too short for the power bank.
 KEEPALIVE_INTERVAL = 90
+KEEPALIVE_LOAD_SEC = 1.5
 WATCHDOG_TIMEOUT = 4.0
 
 
@@ -37,7 +40,8 @@ def enable_watchdog():
 
 
 def keepalive_and_sleep():
-    """Flash one pixel to draw a little current, then go back to sleep."""
+    """Power the LED strips for a moment and flash one pixel, so the power bank sees a
+    load and stays on, then go back to sleep."""
     enable_watchdog()
     print("Keepalive")
     try:
@@ -54,6 +58,7 @@ def keepalive_and_sleep():
         time.sleep(0.05)
         pixels[0] = (0, 0, 0)
         pixels.show()
+        time.sleep(KEEPALIVE_LOAD_SEC)  # keep the strips powered: this is the load that counts
     except Exception as e:
         print("Keepalive flash failed:", repr(e))  # still sleep and keep waiting for the button
     sleep_until_alarms()

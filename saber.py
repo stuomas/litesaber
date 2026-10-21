@@ -276,7 +276,7 @@ class Lightsaber:
     def change_color(self):
         # Changing color is use, even if the saber is held still: restart the idle timer
         self.last_activity = time.monotonic()
-        self.power.ensure_on()  # a tap while off still plays the sound
+        self.power.ensure_on()
         self.sounds.play_sound_by_index(13)
         self.blade.set_next_color(self.is_on())
         if self.is_on():
@@ -1154,8 +1154,9 @@ class Sounds:
 
 
 class Power:
-    """EXTERNAL_POWER feeds the LED strip and the audio amplifier. Even dark, the 72 LEDs
-    draw ~40-70 mA, so it is switched off whenever the blade is off and no sound plays."""
+    """EXTERNAL_POWER feeds the LED strips and the audio amplifier. It stays on the whole
+    time the board is awake: the strips draw ~100 mA even when dark, and that load is what
+    keeps the power bank from switching itself off until the keepalive takes over."""
 
     def __init__(self, sounds):
         self.sounds = sounds
@@ -1172,12 +1173,6 @@ class Power:
         if not self.sounds.muted:
             self.sounds.resume_output()
         self.on = True
-
-    def off_if_idle(self):
-        if self.on and not self.sounds.fx_voice.playing:
-            self.sounds.pause_output()
-            self.pin.value = False
-            self.on = False
 
 
 async def feed_watchdog(lightsaber):
@@ -1338,9 +1333,6 @@ async def animate_blade(lightsaber):
         if lightsaber.is_on():
             blade.animate(motion=lightsaber.sounds.motion)
             lightsaber.sounds.update_hum()
-        else:
-            # Blade off: power down LEDs and amplifier once the last sound has finished
-            lightsaber.power.off_if_idle()
 
 
 def restart_after_error():
@@ -1373,6 +1365,7 @@ def run(sleep_until_alarms):
         Power(sounds),
         sleep_until_alarms,
     )
+    lightsaber.power.ensure_on()  # stays on while awake, see Power
     wdog.feed()
 
     loop = asyncio.get_event_loop()
