@@ -6,6 +6,7 @@ import adafruit_lis3dh
 import alarm
 import audiobusio
 import audiocore
+import audiomixer
 import asyncio
 import board
 from digitalio import DigitalInOut, Direction, Pull
@@ -27,10 +28,18 @@ PER_PIXEL_FADE_SEC = 0.4
 RAINBOW_SCROLL_PIXELS_PER_SEC = 12.0
 # Positions computed between two pixels, so the scroll moves smoothly instead of in pixel jumps
 RAINBOW_SUBSTEPS = 8
-# How often the rainbow blade is redrawn
+# How often the lit blade is redrawn (rainbow scroll) and the hum volume updated
 BLADE_FRAME_SEC = 0.02
 # After a swing or hit sound, wait this long before another swing sound can start
 MOTION_SOUND_COOLDOWN_SEC = 0.3
+# Idle hum (1_idle.wav) volume while lit, 0.0-1.0
+HUM_LEVEL = 0.25
+# Extra hum volume at full swing speed
+HUM_MOTION_BOOST = 0.35
+# Hum volume is multiplied by this while another sound plays
+HUM_DUCKED_FACTOR = 0.4
+# xz acceleration (m/s^2 squared) counted as "not moving" for the motion hum; gravity alone is ~96
+MOTION_REST = 100.0
 # Without accelerometer, movement can't be detected. Sleep this long after the
 # last button press if the blade is on (IDLE_SLEEP_SEC is used when it's off).
 NO_ACCEL_ON_SLEEP_SEC = 600.0
@@ -124,12 +133,14 @@ class Lightsaber:
     def turn_on(self):
         self.power.ensure_on()
         self.sounds.play_sound_by_index(0)
+        self.sounds.start_hum()
         self.switch.update_led_color(self.blade.chosen_color_index)
         self.switch.set_state(True)
         self.blade.set_on()
         print("Lightsaber ON")
 
     def turn_off(self):
+        self.sounds.stop_hum()
         self.sounds.play_sound_by_index(2)
         self.blade.set_off()
         self.switch.turn_off_led()
@@ -141,6 +152,7 @@ class Lightsaber:
         self.blade.save_color()
         if self.is_on():
             # Retract like a normal turn off, and let the sound finish before sleep cuts it
+            self.sounds.stop_hum()
             self.sounds.play_sound_by_index(2)
             self.blade.set_off()
             self.sounds.wait_until_done(timeout=2.0)
@@ -155,6 +167,13 @@ class Lightsaber:
     def hit(self):
         print("hit")
         self.sounds.play_sound_by_index(random.randint(3, 10))
+
+    def set_motion(self, intensity):
+        """Swing intensity 0.0-1.0 from the accelerometer; drives the hum volume."""
+        sounds = self.sounds
+        # Rise fast, fade slowly, so the hum swells with a swing and settles after it
+        rate = 0.5 if intensity > sounds.motion else 0.1
+        sounds.motion += (intensity - sounds.motion) * rate
 
     def change_color(self):
         # Changing color is use, even if the saber is held still: restart the idle timer
@@ -538,11 +557,44 @@ def _mix(a, b, t):
 
 
 class Sounds:
+    """Two mixer voices: the looping hum, and effects (on/off/swing/clash) on top of it."""
+    HUM_INDEX = 1
+
     def __init__(self):
         self.device = audiobusio.I2SOut(board.I2S_BIT_CLOCK, board.I2S_WORD_SELECT, board.I2S_DATA)
         self.files = self._get_sound_files()
         self._file = None
         self._wave = None
+        self._hum_wave = None
+        self._hum_on = False
+        self.motion = 0.0  # swing intensity 0.0-1.0, set by Lightsaber.set_motion
+        self.mixer = self._make_mixer()
+        self.hum_voice = self.mixer.voice[0]
+        self.fx_voice = self.mixer.voice[1]
+        self.fx_voice.level = 1.0
+        # Output starts with Power.ensure_on(): with no I2S clock the amplifier sleeps
+
+    def resume_output(self):
+        if not self.device.playing:
+            self.device.play(self.mixer)
+
+    def pause_output(self):
+        self.device.stop()
+
+    def _make_mixer(self):
+        # The mixer must match the files' format; read it from the first file
+        rate, bits, channels = 22050, 16, 1
+        if self.files:
+            try:
+                with open(self.files[0], "rb") as f:
+                    wave = audiocore.WaveFile(f)
+                    rate, bits, channels = wave.sample_rate, wave.bits_per_sample, wave.channel_count
+                    wave.deinit()
+            except Exception as e:
+                print("Cannot read sound format:", e)
+        return audiomixer.Mixer(
+            voice_count=2, sample_rate=rate, channel_count=channels,
+            bits_per_sample=bits, samples_signed=(bits == 16), buffer_size=2048)
 
     def play_sound_by_index(self, index, loop=False):
         if not 0 <= index < len(self.files):
@@ -551,13 +603,39 @@ class Sounds:
             self.stop()
             self._file = open(self.files[index], "rb")
             self._wave = audiocore.WaveFile(self._file)
-            self.device.play(self._wave, loop=loop)
+            self.fx_voice.play(self._wave, loop=loop)
         except Exception as e:
             print("Cannot play sound:", e)
 
+    def start_hum(self):
+        if self.HUM_INDEX >= len(self.files):
+            return
+        try:
+            if self._hum_wave is None:
+                # Kept open while the board is awake; it loops for as long as the blade is lit
+                self._hum_wave = audiocore.WaveFile(open(self.files[self.HUM_INDEX], "rb"))
+            self._hum_on = True
+            self.update_hum()
+            self.hum_voice.play(self._hum_wave, loop=True)
+        except Exception as e:
+            print("Cannot play hum:", e)
+
+    def stop_hum(self):
+        self._hum_on = False
+        self.hum_voice.stop()
+
+    def update_hum(self):
+        """Set hum volume from swing motion, quieter while an effect plays."""
+        if not self._hum_on:
+            return
+        level = HUM_LEVEL + HUM_MOTION_BOOST * self.motion
+        if self.fx_voice.playing:
+            level *= HUM_DUCKED_FACTOR
+        self.hum_voice.level = min(level, 1.0)
+
     def wait_until_done(self, timeout):
         end = time.monotonic() + timeout
-        while self.device.playing and time.monotonic() < end:
+        while self.fx_voice.playing and time.monotonic() < end:
             time.sleep(0.01)
 
     def play_sound_by_name(self, name, loop=False):
@@ -565,8 +643,8 @@ class Sounds:
         pass
 
     def stop(self):
-        """Stop playback and close the previous sound file."""
-        self.device.stop()
+        """Stop the effect sound and close its file. The hum keeps playing."""
+        self.fx_voice.stop()
         if self._wave is not None:
             try:
                 self._wave.deinit()
@@ -610,10 +688,12 @@ class Power:
             return
         self.pin.value = True
         time.sleep(0.01)  # let the LEDs and amplifier power up
+        self.sounds.resume_output()
         self.on = True
 
     def off_if_idle(self):
-        if self.on and not self.sounds.device.playing:
+        if self.on and not self.sounds.fx_voice.playing:
+            self.sounds.pause_output()
             self.pin.value = False
             self.on = False
 
@@ -660,6 +740,8 @@ async def poll_accelerometer(lightsaber):
             continue
 
         xz_accel = x * x + z * z
+        intensity = (xz_accel - MOTION_REST) / (accel.hit_threshold - MOTION_REST)
+        lightsaber.set_motion(min(max(intensity, 0.0), 1.0))
         if tapped:
             print("tapped")
             lightsaber.change_color()
@@ -745,6 +827,7 @@ async def animate_blade(lightsaber):
         if lightsaber.is_on():
             if blade.is_rainbow():
                 blade.animate_rainbow()
+            lightsaber.sounds.update_hum()
         else:
             # Blade off: power down LEDs and amplifier once the last sound has finished
             lightsaber.power.off_if_idle()
