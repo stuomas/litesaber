@@ -23,6 +23,12 @@ BRIGHTNESS = 0.90
 IDLE_SLEEP_SEC = 45.0
 # Duration of a color fade to or from rainbow
 PER_PIXEL_FADE_SEC = 0.4
+# Rainbow blade scrolls from hilt to tip at this speed
+RAINBOW_SCROLL_PIXELS_PER_SEC = 12.0
+# Positions computed between two pixels, so the scroll moves smoothly instead of in pixel jumps
+RAINBOW_SUBSTEPS = 8
+# How often the rainbow blade is redrawn
+BLADE_FRAME_SEC = 0.02
 # After a swing or hit sound, wait this long before another swing sound can start
 MOTION_SOUND_COOLDOWN_SEC = 0.3
 # Without accelerometer, movement can't be detected. Sleep this long after the
@@ -403,7 +409,9 @@ class Blade:
         # Color options are the palette colors followed by rainbow
         self.rainbow_index = len(self.palette)
         self.color_count = len(self.palette) + 1
-        self._rainbow_frame = None
+        self._rainbow_phases = None  # built on first use
+        self._rainbow_pos = 0.0  # scroll position in substeps
+        self._last_animation = 0.0
         self.color_store = ColorStore(self.color_count)
         self.chosen_color_index = self.color_store.load()
         self.device = self._init_neopixels()
@@ -434,16 +442,51 @@ class Blade:
         pixels.brightness = self.brightness
         return pixels
 
+    def is_rainbow(self):
+        return self.chosen_color_index == self.rainbow_index
+
+    def animate_rainbow(self):
+        """Scroll the rainbow one frame forward. Only call while the rainbow blade is lit."""
+        now = time.monotonic()
+        # Cap the step so the rainbow doesn't jump after a blocking animation or a pause
+        dt = min(now - self._last_animation, 0.05)
+        self._last_animation = now
+        old = int(self._rainbow_pos)
+        total = self.neopixel_amount * RAINBOW_SUBSTEPS
+        self._rainbow_pos = (self._rainbow_pos + dt * RAINBOW_SCROLL_PIXELS_PER_SEC * RAINBOW_SUBSTEPS) % total
+        if int(self._rainbow_pos) != old:
+            self.device[:] = self._rainbow_frame()
+            self.device.show()
+
     def _frame(self, index):
         """Packed color of every pixel for the given color option."""
         if index == self.rainbow_index:
-            if self._rainbow_frame is None:
-                self._rainbow_frame = [
-                    fancy.gamma_adjust(fancy.palette_lookup(self.palette, i / self.neopixel_amount)).pack()
-                    for i in range(self.neopixel_amount)
-                ]
-            return self._rainbow_frame
+            return self._rainbow_frame()
         return [self.palette[index].pack()] * self.neopixel_amount
+
+    def _rainbow_frame(self):
+        """Rainbow at the current scroll position: just a slice of a precomputed list."""
+        if self._rainbow_phases is None:
+            self._build_rainbow()
+        n = self.neopixel_amount
+        # Negative offset moves the colors towards the tip (higher pixel numbers)
+        offset = (-int(self._rainbow_pos)) % (n * RAINBOW_SUBSTEPS)
+        start = offset // RAINBOW_SUBSTEPS
+        return self._rainbow_phases[offset % RAINBOW_SUBSTEPS][start:start + n]
+
+    def _build_rainbow(self):
+        """For each substep, the rainbow shifted by that fraction of a pixel, stored twice
+        in a row so any rotation is a single slice."""
+        n = self.neopixel_amount
+        base = [
+            fancy.gamma_adjust(fancy.palette_lookup(self.palette, i / n)).pack()
+            for i in range(n)
+        ]
+        self._rainbow_phases = []
+        for step in range(RAINBOW_SUBSTEPS):
+            t = step / RAINBOW_SUBSTEPS
+            row = [_mix(base[i], base[(i + 1) % n], t) for i in range(n)]
+            self._rainbow_phases.append(row + row)
 
     def _fade(self, old, new):
         uniform = old.count(old[0]) == len(old) and new.count(new[0]) == len(new)
@@ -695,10 +738,14 @@ async def poll_switch(lightsaber, turn_on_at_start=False):
         switch.last_button_state = current_button_state
 
 
-async def power_down_when_idle(lightsaber):
+async def animate_blade(lightsaber):
+    blade = lightsaber.blade
     while True:
-        await asyncio.sleep(0.1)
-        if not lightsaber.is_on():
+        await asyncio.sleep(BLADE_FRAME_SEC)
+        if lightsaber.is_on():
+            if blade.is_rainbow():
+                blade.animate_rainbow()
+        else:
             # Blade off: power down LEDs and amplifier once the last sound has finished
             lightsaber.power.off_if_idle()
 
@@ -742,7 +789,7 @@ def run(sleep_until_alarms):
     woken_by_button = isinstance(alarm.wake_alarm, alarm.pin.PinAlarm)
     loop.create_task(poll_switch(lightsaber, turn_on_at_start=woken_by_button))
     loop.create_task(poll_accelerometer(lightsaber))
-    loop.create_task(power_down_when_idle(lightsaber))
+    loop.create_task(animate_blade(lightsaber))
     loop.create_task(feed_watchdog(lightsaber))
     loop.run_forever()
     # run_forever should never return; if it does, don't sit idle with the watchdog off
